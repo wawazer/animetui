@@ -1,0 +1,13 @@
+app.py
+setup.py
+animetui.egg-info/PKG-INFO
+animetui.egg-info/SOURCES.txt
+animetui.egg-info/dependency_links.txt
+animetui.egg-info/entry_points.txt
+animetui.egg-info/requires.txt
+animetui.egg-info/top_level.txt
+core/__init__.py
+core/player.py
+core/scraper.py
+ui/__init__.py
+ui/screens.py
