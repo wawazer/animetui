@@ -1,3 +1,7 @@
+import asyncio
+from io import BytesIO
+
+from rich.markup import escape
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -7,7 +11,13 @@ from textual.widgets import Footer, Header, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 from core.player import download_stream, play_stream
-from core.scraper import extract_stream_url, get_episodes, search_content
+from core.scraper import extract_stream_url, fetch_bytes, get_episodes, search_content
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:  # Pillow is optional; the poster URL is still shown.
+    Image = None
+    ImageOps = None
 
 ASCII_BANNER = """
    _    _   _ ___ __  __ _____ _____ _   _ ___ 
@@ -20,11 +30,48 @@ ASCII_BANNER = """
 CHANGELOG_TEXT = """[bold #c084fc]Feature Highlights[/bold #c084fc]
 
   [#10b981]• [Fixed][/] Providers & Stream Resolution
-  [#10b981]• [Fixed][/] Kwik HLS Stream Decoders
+  [#10b981]• [Fixed][/] Kwik & Blogger Stream Decoders
+  [#3b82f6]• [Added][/] Poster / Thumbnail ASCII Preview
   [#3b82f6]• [Added][/] Direct MPV Player & yt-dlp Integration
   [#9ca3af]• [System][/] Desktop User-Agent & Referer Bypass
 
 [bold #8b5cf6]── [s] Search ── [q] Quit ──[/bold #8b5cf6]"""
+
+ASCII_RAMP = " .:-=+*#%@"
+
+
+def render_ascii_image(data: bytes, max_width: int = 36, max_height: int = 10) -> str:
+    """Convert image bytes to a compact grayscale ASCII poster."""
+    if not data or Image is None:
+        return ""
+
+    try:
+        image = Image.open(BytesIO(data)).convert("L")
+    except Exception:
+        return ""
+
+    if image.width <= 0 or image.height <= 0:
+        return ""
+
+    aspect = image.height / image.width
+    width = max_width
+    height = max(1, int(width * aspect * 0.45))
+
+    if height > max_height:
+        height = max_height
+        width = max(8, int(height / (aspect * 0.45)))
+
+    image = image.resize((width, height))
+    if ImageOps is not None:
+        image = ImageOps.autocontrast(image)
+
+    pixels = list(image.tobytes())
+    lines = []
+    for y in range(height):
+        row = pixels[y * width:(y + 1) * width]
+        lines.append("".join(ASCII_RAMP[p * (len(ASCII_RAMP) - 1) // 255] for p in row))
+
+    return "\n".join(line.rstrip() for line in lines)
 
 
 class WelcomeScreen(Screen):
@@ -158,6 +205,17 @@ class SearchScreen(Screen):
         padding-bottom: 1;
     }
 
+    #poster-preview {
+        width: 100%;
+        height: 12;
+        border: round #374151;
+        background: #0b0b0b;
+        color: #e5e7eb;
+        content-align: center middle;
+        text-align: center;
+        margin-bottom: 1;
+    }
+
     #detail-card {
         height: 6;
         border-bottom: solid #374151;
@@ -191,6 +249,7 @@ class SearchScreen(Screen):
         self.search_results: list[dict] = []
         self.episode_results: list[dict] = []
         self.active_anime: dict | None = None
+        self._poster_cache: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -204,6 +263,7 @@ class SearchScreen(Screen):
 
             with Vertical(classes="column"):
                 yield Label("Anime Details & Episodes", classes="column-title")
+                yield Static("Poster preview", id="poster-preview")
                 yield Static("Select an anime to inspect episodes", id="detail-card")
                 yield OptionList(id="episodes-list")
 
@@ -216,6 +276,12 @@ class SearchScreen(Screen):
     def set_status(self, text: str) -> None:
         status = self.query_one("#status-bar", Static)
         status.update(text)
+
+    def _update_poster(self, content: str) -> None:
+        try:
+            self.query_one("#poster-preview", Static).update(content)
+        except Exception:
+            pass
 
     def action_focus_search(self) -> None:
         self.query_one("#search-input", Input).focus()
@@ -262,8 +328,34 @@ class SearchScreen(Screen):
         detail_card = self.query_one("#detail-card", Static)
         title = self.active_anime.get("title", "")
         status = self.active_anime.get("status", "")
-        detail_card.update(f"[bold #c084fc]{title}[/]\nStatus: {status}\nLoading episodes...")
+        thumbnail = self.active_anime.get("thumbnail", "")
+        detail_card.update(
+            f"[bold #c084fc]{title}[/]\n"
+            f"Status: {status}\n"
+            f"Poster: {thumbnail or 'N/A'}\n"
+            "Loading episodes..."
+        )
+        self._update_poster(
+            "[dim]Loading poster preview...[/dim]" if thumbnail else "[dim]No poster available[/dim]"
+        )
         self.fetch_episodes(self.active_anime["url"])
+
+    async def show_poster(self, thumbnail_url: str) -> None:
+        if not thumbnail_url:
+            self._update_poster("[dim]No poster available[/dim]")
+            return
+
+        cached = self._poster_cache.get(thumbnail_url)
+        if cached is not None:
+            self._update_poster(cached or f"[dim]{escape(thumbnail_url)}[/dim]")
+            return
+
+        self._update_poster("[dim]Loading poster preview...[/dim]")
+        referer = self.active_anime.get("url") if self.active_anime else None
+        data = await fetch_bytes(thumbnail_url, referer=referer)
+        art = await asyncio.to_thread(render_ascii_image, data) if data else ""
+        self._poster_cache[thumbnail_url] = art
+        self._update_poster(art or f"[dim]{escape(thumbnail_url)}[/dim]")
 
     @work(exclusive=True)
     async def fetch_episodes(self, url: str) -> None:
@@ -274,15 +366,24 @@ class SearchScreen(Screen):
         self.episode_results = await get_episodes(url)
         detail_card = self.query_one("#detail-card", Static)
 
-        if self.active_anime:
-            title = self.active_anime.get("title", "")
-            status = self.active_anime.get("status", "")
-            detail_card.update(
-                f"[bold #c084fc]{title}[/]\nStatus: {status}\nTotal Episodes: {len(self.episode_results)}"
+        title = self.active_anime.get("title", "") if self.active_anime else ""
+        status = self.active_anime.get("status", "") if self.active_anime else ""
+        thumbnail = self.active_anime.get("thumbnail", "") if self.active_anime else ""
+        if not thumbnail:
+            thumbnail = next(
+                (ep.get("thumbnail", "") for ep in self.episode_results if ep.get("thumbnail")),
+                "",
             )
 
+        detail_card.update(
+            f"[bold #c084fc]{title}[/]\n"
+            f"Status: {status}\n"
+            f"Total Episodes: {len(self.episode_results)}\n"
+            f"Poster: {thumbnail or 'N/A'}"
+        )
         if not self.episode_results:
             self.set_status("No episodes found.")
+            await self.show_poster(thumbnail)
             return
 
         for idx, ep in enumerate(self.episode_results):
@@ -292,6 +393,7 @@ class SearchScreen(Screen):
 
         self.set_status(f"Loaded {len(self.episode_results)} episodes.")
         ep_widget.focus()
+        await self.show_poster(thumbnail)
 
     def get_selected_episode(self) -> dict | None:
         ep_widget = self.query_one("#episodes-list", OptionList)
@@ -319,14 +421,27 @@ class SearchScreen(Screen):
         action_verb = "Downloading" if download else "Resolving stream"
         self.set_status(f"{action_verb}: {episode['title']}...")
 
-        stream_url, referer = await extract_stream_url(episode["url"])
-        target_url = stream_url or episode["url"]
+        selected_episode_url = episode["url"]
+        res = await extract_stream_url(selected_episode_url)
+        if isinstance(res, tuple):
+            stream_url, referer_url = res
+        else:
+            stream_url, referer_url = res, selected_episode_url
+
+        if stream_url and stream_url.startswith("//"):
+            stream_url = "https:" + stream_url
+
+        if not stream_url:
+            self.set_status(f"Could not resolve a playable stream for: {episode['title']}")
+            return
+
+        referer_url = referer_url or selected_episode_url
 
         if download:
             self.set_status(f"Starting download: {episode['title']}...")
-            success, msg = download_stream(target_url, episode["title"], referer=referer)
+            success, msg = download_stream(stream_url, episode["title"], referer=referer_url)
         else:
             self.set_status(f"Launching MPV: {episode['title']}...")
-            success, msg = play_stream(target_url, episode["title"], referer=referer)
+            success, msg = play_stream(stream_url, referer_url, episode["title"])
 
         self.set_status(msg)
